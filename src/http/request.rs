@@ -11,6 +11,8 @@ use crate::ngx_null_string;
 /// Define a static request handler.
 ///
 /// Handlers are expected to take a single [`Request`] argument and return a [`Status`].
+///
+// pub type ngx_http_handler_pt = ::core::option::Option<unsafe extern "C" fn(r: *mut ngx_http_request_t) -> ngx_int_t>;
 #[macro_export]
 macro_rules! http_request_handler {
     ( $name: ident, $handler: expr ) => {
@@ -18,6 +20,35 @@ macro_rules! http_request_handler {
             let status: $crate::core::Status =
                 $handler(unsafe { &mut $crate::http::Request::from_ngx_http_request(r) });
             status.0
+        }
+    };
+}
+
+/*
+/*
+pub type ngx_http_log_handler_pt = ::core::option::Option<
+    unsafe extern "C" fn(
+        r: *mut ngx_http_request_t,
+        sr: *mut ngx_http_request_t,
+        buf: *mut u_char,
+        len: usize,
+    ) -> *mut u_char,
+>;
+*/
+*/
+#[macro_export]
+macro_rules! http_log_handler {
+    ( $name: ident, $handler: expr ) => {
+        extern "C" fn $name(
+            r: *mut $crate::ffi::ngx_http_request_t,
+            sr: *mut $crate::ffi::ngx_http_request_t,
+            buf: *mut $crate::ffi::u_char,
+            len: usize,
+        ) -> *mut $crate::ffi::u_char {
+            $handler(
+                unsafe { &mut $crate::http::Request::from_ngx_http_request(r) },
+                unsafe { &mut $crate::http::Request::from_ngx_http_request(sr) },
+            )
         }
     };
 }
@@ -209,6 +240,13 @@ impl Request {
         // SAFETY: ctx is either NULL or allocated with ngx_p(c)alloc and
         // explicitly initialized by the module
         unsafe { ctx.as_ref() }
+    }
+
+    pub fn get_mutable_module_ctx<T>(&self, module: &ngx_module_t) -> Option<&mut T> {
+        let ctx = self.get_module_ctx_ptr(module).cast::<T>();
+        // SAFETY: ctx is either NULL or allocated with ngx_p(c)alloc and
+        // explicitly initialized by the module
+        unsafe { ctx.as_mut() }
     }
 
     /// Sets the value as the module's context.

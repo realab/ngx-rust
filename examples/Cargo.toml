@@ -15,6 +15,7 @@ build = "../build.rs"
 [dependencies]
 nginx-sys = { path = "../nginx-sys/", default-features = false }
 ngx = { path = "../", default-features = false, features = ["std"] }
+cpu-arl-rs = { path = "../../cpu-arl-rs" }
 
 [dev-dependencies]
 aws-sign-v4 = "0.3.0"
@@ -47,6 +48,11 @@ crate-type = ["cdylib"]
 [[example]]
 name = "async"
 path = "async.rs"
+crate-type = ["cdylib"]
+
+[[example]]
+name = "bbr"
+path = "bbr.rs"
 crate-type = ["cdylib"]
 
 [features]
