@@ -57,8 +57,9 @@ impl Default for ModuleConfig {
             .enable_all()
             .build()
             .unwrap();
+        let opts = limiter::Options::cgroup_default();
         let handle = rt.spawn(async move {
-            let limiter = limiter::ARLLimiter::new(limiter::Options::default());
+            let limiter = limiter::ARLLimiter::new(opts);
             GLOBAL_LIMITER.write().unwrap().replace(Arc::new(limiter));
         });
         rt.block_on(handle).unwrap();
