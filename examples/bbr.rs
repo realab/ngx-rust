@@ -1,14 +1,15 @@
 use cpu_arl_rs::limiter;
 use nginx_sys::ngx_http_log_handler_pt;
 
+use once_cell::sync::Lazy;
 use std::ffi::{c_char, c_void};
-use std::io::empty;
 use std::ptr::addr_of;
+use std::sync::{Arc, RwLock};
 
 use ngx::ffi::{
     ngx_array_push, ngx_command_t, ngx_conf_t, ngx_http_core_module, ngx_http_handler_pt, ngx_http_module_t,
     ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_http_phases_NGX_HTTP_LOG_PHASE, ngx_int_t, ngx_module_t, ngx_str_t,
-    ngx_uint_t, NGX_CONF_TAKE1, NGX_HTTP_LOC_CONF, NGX_HTTP_LOC_CONF_OFFSET, NGX_HTTP_MODULE,
+    ngx_uint_t, NGX_CONF_TAKE1, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE,
 };
 use ngx::http::{self, HTTPModule, MergeConfigError};
 use ngx::{core, ffi};
@@ -44,14 +45,25 @@ impl http::HTTPModule for Module {
 }
 
 struct ModuleConfig {
-    limiter: limiter::ARLLimiter,
+    // limiter: limiter::ARLLimiter,
     enable: bool,
 }
 
+static GLOBAL_LIMITER: Lazy<RwLock<Option<Arc<limiter::ARLLimiter>>>> = Lazy::new(|| RwLock::new(None));
+
 impl Default for ModuleConfig {
     fn default() -> Self {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let handle = rt.spawn(async move {
+            let limiter = limiter::ARLLimiter::new(limiter::Options::default());
+            GLOBAL_LIMITER.write().unwrap().replace(Arc::new(limiter));
+        });
+        rt.block_on(handle).unwrap();
         Self {
-            limiter: limiter::ARLLimiter::new(limiter::Options::default()),
+            // limiter: GLOBAL_LIMITER.write().unwrap(),
             enable: false,
         }
     }
@@ -60,9 +72,9 @@ impl Default for ModuleConfig {
 static mut NGX_HTTP_BBR_COMMANDS: [ngx_command_t; 2] = [
     ngx_command_t {
         name: ngx_string!("bbr"),
-        type_: (NGX_HTTP_LOC_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
+        type_: (NGX_HTTP_MAIN_CONF | NGX_CONF_TAKE1) as ngx_uint_t,
         set: Some(ngx_http_bbr_commands_set_enable),
-        conf: NGX_HTTP_LOC_CONF_OFFSET,
+        conf: NGX_HTTP_MAIN_CONF_OFFSET,
         offset: 0,
         post: std::ptr::null_mut(),
     },
@@ -148,9 +160,11 @@ http_request_handler!(bbr_access_handler, |request: &mut http::Request| {
             if bbr_ctx.is_null() {
                 return core::Status::NGX_ERROR;
             }
-            if let Ok(done) = co.limiter.allow() {
+            let limiter = GLOBAL_LIMITER.read().unwrap().as_ref().cloned().unwrap();
+            if let Ok(done) = limiter.allow() {
+                ngx_log_debug_http!(request, "bbr module: allowed");
                 unsafe {
-                    (*bbr_ctx).done = Some(Box::new(done));
+                    (*bbr_ctx).done = Some(done);
                     request.set_module_ctx(bbr_ctx as *mut c_void, &*addr_of!(ngx_http_bbr_module));
                 }
                 return core::Status::NGX_DECLINED;

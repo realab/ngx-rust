@@ -1,8 +1,5 @@
 [workspace]
-members = [
-    "nginx-sys",
-    "examples",
-]
+members = ["nginx-sys", "examples"]
 
 [workspace.package]
 edition = "2021"
@@ -25,10 +22,10 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-nginx-sys = { path = "nginx-sys", default-features=false, version = "0.5.0"}
+nginx-sys = { path = "nginx-sys", default-features = false, version = "0.5.0" }
 
 [features]
-default = ["vendored","std"]
+default = ["vendored", "std"]
 # Enables the components using memory allocation.
 # If no `std` flag, `alloc` crate is internally used instead. This flag is mainly for `no_std` build.
 alloc = []

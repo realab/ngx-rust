@@ -16,6 +16,7 @@ build = "../build.rs"
 nginx-sys = { path = "../nginx-sys/", default-features = false }
 ngx = { path = "../", default-features = false, features = ["std"] }
 cpu-arl-rs = { path = "../../cpu-arl-rs" }
+once_cell = "1.20.2"
 
 [dev-dependencies]
 aws-sign-v4 = "0.3.0"
