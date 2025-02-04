@@ -104,11 +104,9 @@ extern "C" fn ngx_http_cron_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
         ngx_http_cron_dummy_conn.fd = -1;
         ngx_http_cron_dummy_conn.log = (*cycle).log;
 
-        // Pool::from_ngx_pool(self.0.pool) .
-
-        // cycle.pool().alloc(std::mem::size_of::<RequestCTX>()) as *mut RequestCTX
         let ngx_http_core_timer =
             core::Pool::from_ngx_pool((*cycle).pool).alloc(std::mem::size_of::<ngx_event_t>()) as *mut ngx_event_t;
+        (*ngx_http_core_timer).handler = Some(ngx_http_cron_timer_handler);
         (*ngx_http_core_timer).data = std::ptr::null_mut();
         (*ngx_http_core_timer).log = (*cycle).log;
         (*ngx_http_core_timer).set_cancelable(1);
