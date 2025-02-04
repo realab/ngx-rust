@@ -1,5 +1,6 @@
 use cpu_arl_rs::{cpu, limiter};
 use nginx_sys::ngx_http_log_handler_pt;
+use std::path;
 use std::ptr::addr_of;
 
 use once_cell::sync::Lazy;
@@ -63,9 +64,13 @@ impl Default for ModuleConfig {
                 let loader = Arc::new(cpu::EMACPUUsageLoader::new(Box::new(provider)));
                 GLOBAL_CPU_LOADER.write().unwrap().replace(loader);
             }
-            #[cfg(all(target_os = "linux", feature = "cgroup"))]
+            #[cfg(target_os = "linux")]
             limiter::CPUStatProviderName::CGroup => {
-                panic!("unsupported cpu provider: {:?}", cfg.cpu_provider);
+                use cpu_arl_rs::cgroup;
+                let provider =
+                    cgroup::CGroupCPUStatProvider::new(path::PathBuf::from("/sys/fs/cgroup/"), false).unwrap();
+                let loader = Arc::new(cpu::EMACPUUsageLoader::new(Box::new(provider)));
+                GLOBAL_CPU_LOADER.write().unwrap().replace(loader);
             }
             _ => {
                 panic!("unsupported cpu provider: {:?}", cfg.cpu_provider);
@@ -152,7 +157,7 @@ http_log_handler!(
     |request: &mut http::Request, _: &mut http::Request| {
         let bbr_ctx = unsafe { request.get_mutable_module_ctx::<NgxBBRCtx>(&*addr_of!(ngx_http_bbr_module)) };
         if let Some(ctx) = bbr_ctx {
-            ngx_log_debug_http!(request, "bbr: found context",);
+            // ngx_log_debug_http!(request, "bbr: found context",);
             ctx.call_done();
         };
         std::ptr::null_mut()
@@ -167,7 +172,7 @@ http_request_handler!(bbr_access_handler, |request: &mut http::Request| {
 
     match co.enable {
         true => {
-            ngx_log_debug_http!(request, "bbr module enabled: {}", co.enable);
+            // ngx_log_debug_http!(request, "bbr module enabled: {}", co.enable);
 
             let bbr_ctx = request.pool().allocate::<NgxBBRCtx>(Default::default());
             if bbr_ctx.is_null() {
@@ -176,15 +181,16 @@ http_request_handler!(bbr_access_handler, |request: &mut http::Request| {
 
             let limiter = GLOBAL_LIMITER.read().unwrap().as_ref().cloned().unwrap();
             if let Ok(done) = limiter.allow() {
-                ngx_log_debug_http!(request, "bbr module: allowed");
+                // ngx_log_debug_http!(request, "bbr module: allowed");
                 unsafe {
                     (*bbr_ctx).done = Some(done);
                     request.set_module_ctx(bbr_ctx as *mut c_void, &*addr_of!(ngx_http_bbr_module));
                 }
                 return core::Status::NGX_DECLINED;
             }
-            ngx_log_debug_http!(request, "bbr module: too many requests");
-            http::HTTPStatus::TOO_MANY_REQUESTS.into()
+            // ngx_log_debug_http!(request, "bbr module: BANDWIDTH_LIMIT_EXCEEDED");
+            println!("bbr module: BANDWIDTH_LIMIT_EXCEEDED");
+            http::HTTPStatus::BANDWIDTH_LIMIT_EXCEEDED.into()
         }
         false => core::Status::NGX_DECLINED,
     }
@@ -251,9 +257,18 @@ extern "C" fn ngx_http_cpu_loader_init_process(cycle: *mut ngx_cycle_t) -> ngx_i
 #[no_mangle]
 extern "C" fn ngx_http_cpu_loader_timer_handler(ev: *mut ngx_event_t) {
     GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().refresh_cpu_usage();
-    let usage = GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().get_cpu_usage();
+
+    let limiter = GLOBAL_LIMITER.read().unwrap();
+    let limiter = limiter.as_ref().unwrap();
     unsafe {
-        ngx_log_error!(ffi::NGX_LOG_NOTICE, (*ev).log, "[bbr-module] CPU usage: {:.2}%", usage);
+        ngx_log_error!(
+            ffi::NGX_LOG_ERR,
+            (*ev).log,
+            "[bbr-module] CPU usage: {:.2}%, max_inflight: {:?}, inflight: {:?}",
+            limiter.get_cpu_usage(),
+            limiter.max_in_flight(),
+            limiter.in_flight(),
+        );
 
         if !(ngx_exiting == 1) && !(ngx_quit == 1) {
             let event: &mut core::Event = ev.into();
