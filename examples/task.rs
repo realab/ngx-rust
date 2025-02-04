@@ -100,19 +100,21 @@ extern "C" fn ngx_http_cron_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
             ngx_worker,
         );
 
-        let mut ngx_http_cron_dummy_conn: ngx_connection_t = std::mem::zeroed();
-        ngx_http_cron_dummy_conn.fd = -1;
-        ngx_http_cron_dummy_conn.log = (*cycle).log;
+        let ngx_http_cron_dummy_conn = core::Pool::from_ngx_pool((*cycle).pool)
+            .alloc(std::mem::size_of::<ngx_connection_t>())
+            as *mut ngx_connection_t;
+        (*ngx_http_cron_dummy_conn).fd = -1;
+        (*ngx_http_cron_dummy_conn).log = (*cycle).log;
 
         let ngx_http_core_timer =
             core::Pool::from_ngx_pool((*cycle).pool).alloc(std::mem::size_of::<ngx_event_t>()) as *mut ngx_event_t;
         (*ngx_http_core_timer).handler = Some(ngx_http_cron_timer_handler);
-        (*ngx_http_core_timer).data = std::ptr::null_mut();
+        (*ngx_http_core_timer).data = ngx_http_cron_dummy_conn as *mut c_void;
         (*ngx_http_core_timer).log = (*cycle).log;
         (*ngx_http_core_timer).set_cancelable(1);
 
         let timer: &mut Event = ngx_http_core_timer.into();
-        timer.add_timer(10000);
+        timer.add_timer(1000);
 
         return core::Status::NGX_OK.into();
     }
@@ -129,7 +131,7 @@ extern "C" fn ngx_http_cron_timer_handler(ev: *mut ngx_event_t) {
 
         if !(ngx_exiting == 1) && !(ngx_quit == 1) {
             let event: &mut Event = ev.into();
-            event.add_timer(10000);
+            event.add_timer(1000);
         }
     }
 }
