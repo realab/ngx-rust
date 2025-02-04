@@ -1,21 +1,20 @@
-use cpu_arl_rs::limiter;
+use cpu_arl_rs::{cpu, limiter};
 use nginx_sys::ngx_http_log_handler_pt;
-use std::ptr::{addr_of, addr_of_mut};
+use std::ptr::addr_of;
 
 use once_cell::sync::Lazy;
 use std::ffi::{c_char, c_void};
 use std::sync::{Arc, RwLock};
 
 use ngx::ffi::{
-    ngx_array_push, ngx_command_t, ngx_conf_t, ngx_cycle_t, ngx_event_t, ngx_event_timer_rbtree, ngx_http_core_module,
-    ngx_http_handler_pt, ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_http_phases_NGX_HTTP_LOG_PHASE,
-    ngx_int_t, ngx_module_t, ngx_msec_int_t, ngx_msec_t, ngx_posted_events, ngx_process, ngx_queue_s,
-    ngx_rbtree_delete, ngx_rbtree_insert, ngx_str_t, ngx_uint_t, NGX_CONF_TAKE1, NGX_HTTP_MAIN_CONF,
-    NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_PROCESS_WORKER, NGX_TIMER_LAZY_DELAY,
+    ngx_array_push, ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t, ngx_event_t, ngx_exiting,
+    ngx_http_core_module, ngx_http_handler_pt, ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE,
+    ngx_http_phases_NGX_HTTP_LOG_PHASE, ngx_int_t, ngx_module_t, ngx_process, ngx_quit, ngx_str_t, ngx_uint_t,
+    ngx_worker, NGX_CONF_TAKE1, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_PROCESS_WORKER,
 };
 use ngx::http::{self, HTTPModule, MergeConfigError};
 use ngx::{core, ffi};
-use ngx::{http_log_handler, http_request_handler, ngx_log_debug_http, ngx_null_command, ngx_string};
+use ngx::{http_log_handler, http_request_handler, ngx_log_debug_http, ngx_log_error, ngx_null_command, ngx_string};
 
 struct Module;
 
@@ -41,123 +40,44 @@ impl http::HTTPModule for Module {
             return core::Status::NGX_ERROR.into();
         }
         *done_h = Some(bbr_done_handler);
-
-        // (*(*cf).cycle).
-
-        start_background_task((*cf).cycle);
-
         core::Status::NGX_OK.into()
     }
-
-    // unsafe extern "C" fn create_main_conf(cf: *mut ngx_conf_t) -> *mut c_void {
-    //     start_background_task((*cf).cycle);
-    //     let mut a: c_void = std::mem::zeroed();
-    //     &mut a as *mut c_void
-    // }
 }
 
 struct ModuleConfig {
-    // limiter: limiter::ARLLimiter,
+    cpu_provider: limiter::CPUStatProviderName,
     enable: bool,
 }
 
-unsafe fn post_event(event: *mut ngx_event_t, queue: *mut ngx_queue_s) {
-    let event = &mut (*event);
-    if event.posted() == 0 {
-        event.set_posted(1);
-        // translated from ngx_queue_insert_tail macro
-        event.queue.prev = (*queue).prev;
-        (*event.queue.prev).next = &event.queue as *const _ as *mut _;
-        event.queue.next = queue;
-        (*queue).prev = &event.queue as *const _ as *mut _;
-    }
-}
-
-static GLOBAL_LIMITER: Lazy<RwLock<Option<Arc<limiter::ARLLimiter>>>> = Lazy::new(|| RwLock::new(None));
+static GLOBAL_CPU_LOADER: Lazy<RwLock<Option<Arc<cpu::EMACPUUsageLoader>>>> = Lazy::new(|| RwLock::new(None));
 
 impl Default for ModuleConfig {
     fn default() -> Self {
-        // let rt = tokio::runtime::Builder::new_multi_thread()
-        //     .enable_all()
-        //     .build()
-        //     .unwrap();
-        // let opts = limiter::Options::default();
-        // let handle = rt.spawn(async move {
-        //     let limiter = limiter::ARLLimiter::new(opts);
-        //     GLOBAL_LIMITER.write().unwrap().replace(Arc::new(limiter));
-        // });
-        // rt.block_on(handle).unwrap();
-        Self {
-            // limiter: GLOBAL_LIMITER.write().unwrap(),
+        let cfg = Self {
+            cpu_provider: limiter::CPUStatProviderName::Machine,
             enable: false,
-        }
-    }
-}
-
-static mut MY_EVENT: ngx_event_t = unsafe { std::mem::zeroed() };
-
-extern "C" fn background_task(ev: *mut ngx_event_t) {
-    println!("background task: {:?}", std::time::Instant::now());
-    // Re-schedule the task after 1000ms (1 second)
-    ngx_event_add_timer(ev, 1000);
-}
-
-fn ngx_event_del_timer(ev: *mut ngx_event_t) {
-    unsafe {
-        ngx_rbtree_delete(&mut ngx_event_timer_rbtree as *mut _, &mut (*ev).timer as *mut _);
-
-        // ngx_log_debug2(NGX_LOG_DEBUG_EVENT, ev->log, 0,
-        //                "event timer del: %d: %M",
-        //                 ngx_event_ident(ev->data), ev->timer.key);
-
-        // ngx_rbtree_delete(&ngx_event_timer_rbtree, &ev->timer);
-
-        (*ev).set_timer_set(0);
-    }
-}
-
-fn ngx_event_add_timer(ev: *mut ngx_event_t, timer: ngx_msec_t) {
-    unsafe {
-        let key = ffi::ngx_current_msec + timer;
-
-        println!("ngx_event_add_timer: key: {}/{}", key, (*ev).timer.key);
-
-        if (*ev).timer_set() == 1 {
-            let diff = (key - (*ev).timer.key) as ngx_msec_int_t;
-
-            if diff.abs() < NGX_TIMER_LAZY_DELAY as isize {
-                return;
+        };
+        match cfg.cpu_provider {
+            limiter::CPUStatProviderName::Machine => {
+                let provider = cpu::MachineCPUStatProvider::new().unwrap();
+                let loader = Arc::new(cpu::EMACPUUsageLoader::new(Box::new(provider)));
+                GLOBAL_CPU_LOADER.write().unwrap().replace(loader);
             }
-
-            ngx_event_del_timer(ev);
+            #[cfg(all(target_os = "linux", feature = "cgroup"))]
+            limiter::CPUStatProviderName::CGroup => {
+                panic!("unsupported cpu provider: {:?}", cfg.cpu_provider);
+            }
+            _ => {
+                panic!("unsupported cpu provider: {:?}", cfg.cpu_provider);
+            }
         }
-        (*ev).timer.key = key;
-        ngx_rbtree_insert(&raw mut ngx_event_timer_rbtree, &mut (*ev).timer);
-        (*ev).set_timer_set(1);
 
-        println!("ngx_event_add_timer: key: {}/{}", (*ev).timer.key, (*ev).timer_set());
-    }
-}
+        let opts = limiter::Options::default();
+        let cpu_getter = Box::new(|| GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().get_cpu_usage());
+        let limiter = limiter::ARLLimiter::new(cpu_getter, opts);
+        GLOBAL_LIMITER.write().unwrap().replace(Arc::new(limiter));
 
-extern "C" fn start_background_task(cycle: *mut ngx_cycle_t) -> ngx_int_t {
-    unsafe {
-        if ngx_process != NGX_PROCESS_WORKER as usize {
-            return core::Status::NGX_OK.into();
-        }
-    }
-
-    println!("start background task");
-    unsafe {
-        MY_EVENT.handler = Some(background_task);
-        MY_EVENT.set_cancelable(1);
-        MY_EVENT.log = (*cycle).log;
-        // MY_EVENT.set_timer_set(0);
-        // MY_EVENT.set_active(1);
-
-        // Start the timer, run the task every 1000ms (1 second)
-        ngx_event_add_timer(&raw mut MY_EVENT, 1000);
-        println!("start background task success");
-        core::Status::NGX_OK.into()
+        cfg
     }
 }
 
@@ -196,7 +116,7 @@ pub static mut ngx_http_bbr_module: ngx_module_t = ngx_module_t {
     ctx: std::ptr::addr_of!(NGX_HTTP_BBR_MODULE_CTX) as _,
     commands: unsafe { &NGX_HTTP_BBR_COMMANDS[0] as *const _ as *mut _ },
     type_: NGX_HTTP_MODULE as _,
-    init_process: Some(start_background_task),
+    init_process: Some(ngx_http_cpu_loader_init_process),
     ..ngx_module_t::default()
 };
 
@@ -230,45 +150,41 @@ impl NgxBBRCtx {
 http_log_handler!(
     bbr_done_handler,
     |request: &mut http::Request, _: &mut http::Request| {
-        use ffi;
         let bbr_ctx = unsafe { request.get_mutable_module_ctx::<NgxBBRCtx>(&*addr_of!(ngx_http_bbr_module)) };
         if let Some(ctx) = bbr_ctx {
             ngx_log_debug_http!(request, "bbr: found context",);
             ctx.call_done();
         };
-        let ret = 0u8;
-        &ret as *const _ as *mut ffi::u_char
+        std::ptr::null_mut()
     }
 );
+
+static GLOBAL_LIMITER: Lazy<RwLock<Option<Arc<limiter::ARLLimiter>>>> = Lazy::new(|| RwLock::new(None));
 
 http_request_handler!(bbr_access_handler, |request: &mut http::Request| {
     let co = unsafe { request.get_module_main_conf::<ModuleConfig>(&*addr_of!(ngx_http_bbr_module)) };
     let co = co.expect("module config is none");
 
-    ngx_log_debug_http!(request, "bbr module enabled: {}", co.enable);
-    unsafe {
-        post_event(&raw mut MY_EVENT, addr_of_mut!(ngx_posted_events));
-    }
-
     match co.enable {
         true => {
-            // let bbr_ctx = request.pool().allocate::<NgxBBRCtx>(Default::default());
-            // if bbr_ctx.is_null() {
-            //     return core::Status::NGX_ERROR;
-            // }
-            // let limiter = GLOBAL_LIMITER.read().unwrap().as_ref().cloned().unwrap();
-            // if let Ok(done) = limiter.allow() {
-            //     ngx_log_debug_http!(request, "bbr module: allowed");
-            //     unsafe {
-            //         (*bbr_ctx).done = Some(done);
-            //         request.set_module_ctx(bbr_ctx as *mut c_void, &*addr_of!(ngx_http_bbr_module));
-            //     }
-            //     return core::Status::NGX_DECLINED;
-            // }
-            // ngx_log_debug_http!(request, "bbr module: too many requests");
-            // http::HTTPStatus::TOO_MANY_REQUESTS.into()
+            ngx_log_debug_http!(request, "bbr module enabled: {}", co.enable);
 
-            return core::Status::NGX_DECLINED;
+            let bbr_ctx = request.pool().allocate::<NgxBBRCtx>(Default::default());
+            if bbr_ctx.is_null() {
+                return core::Status::NGX_ERROR;
+            }
+
+            let limiter = GLOBAL_LIMITER.read().unwrap().as_ref().cloned().unwrap();
+            if let Ok(done) = limiter.allow() {
+                ngx_log_debug_http!(request, "bbr module: allowed");
+                unsafe {
+                    (*bbr_ctx).done = Some(done);
+                    request.set_module_ctx(bbr_ctx as *mut c_void, &*addr_of!(ngx_http_bbr_module));
+                }
+                return core::Status::NGX_DECLINED;
+            }
+            ngx_log_debug_http!(request, "bbr module: too many requests");
+            http::HTTPStatus::TOO_MANY_REQUESTS.into()
         }
         false => core::Status::NGX_DECLINED,
     }
@@ -296,4 +212,52 @@ extern "C" fn ngx_http_bbr_commands_set_enable(
     };
 
     std::ptr::null_mut()
+}
+
+#[no_mangle]
+extern "C" fn ngx_http_cpu_loader_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
+    unsafe {
+        if ngx_process != NGX_PROCESS_WORKER as usize {
+            return core::Status::NGX_OK.into();
+        }
+
+        ngx_log_error!(
+            ffi::NGX_LOG_NOTICE,
+            (*cycle).log,
+            "[cron-module] Initializing cron timer in worker process {}",
+            ngx_worker,
+        );
+
+        let ngx_http_cron_dummy_conn = core::Pool::from_ngx_pool((*cycle).pool)
+            .alloc(std::mem::size_of::<ngx_connection_t>())
+            as *mut ngx_connection_t;
+        (*ngx_http_cron_dummy_conn).fd = -1;
+        (*ngx_http_cron_dummy_conn).log = (*cycle).log;
+
+        let ngx_http_core_timer =
+            core::Pool::from_ngx_pool((*cycle).pool).alloc(std::mem::size_of::<ngx_event_t>()) as *mut ngx_event_t;
+        (*ngx_http_core_timer).handler = Some(ngx_http_cpu_loader_timer_handler);
+        (*ngx_http_core_timer).data = ngx_http_cron_dummy_conn as *mut c_void;
+        (*ngx_http_core_timer).log = (*cycle).log;
+        (*ngx_http_core_timer).set_cancelable(1);
+
+        let timer: &mut core::Event = ngx_http_core_timer.into();
+        timer.add_timer(1000);
+
+        return core::Status::NGX_OK.into();
+    }
+}
+
+#[no_mangle]
+extern "C" fn ngx_http_cpu_loader_timer_handler(ev: *mut ngx_event_t) {
+    GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().refresh_cpu_usage();
+    let usage = GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().get_cpu_usage();
+    unsafe {
+        ngx_log_error!(ffi::NGX_LOG_NOTICE, (*ev).log, "[bbr-module] CPU usage: {:.2}%", usage);
+
+        if !(ngx_exiting == 1) && !(ngx_quit == 1) {
+            let event: &mut core::Event = ev.into();
+            event.add_timer(1000);
+        }
+    }
 }

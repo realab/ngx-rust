@@ -56,36 +56,6 @@ pub static mut ngx_http_task_module: ngx_module_t = ngx_module_t {
     ..ngx_module_t::default()
 };
 
-// static ngx_int_t
-// ngx_http_cron_init_process(ngx_cycle_t *cycle)
-// {
-//     // Only run in actual worker processes (not master or cache loader processes).
-//     if (ngx_process != NGX_PROCESS_WORKER) {
-//         return NGX_OK;
-//     }
-
-//     ngx_log_error(NGX_LOG_NOTICE, cycle->log, 0,
-//                   "[cron-module] Initializing cron timer in worker process %d",
-//                   ngx_worker);
-
-//     // Initialize a dummy connection for the timer event
-//     ngx_memzero(&ngx_http_cron_dummy_conn, sizeof(ngx_http_cron_dummy_conn));
-//     ngx_http_cron_dummy_conn.fd = (ngx_socket_t) -1;
-//     ngx_http_cron_dummy_conn.log = cycle->log;
-
-//     // Set up the event
-//     ngx_memzero(&ngx_http_cron_timer, sizeof(ngx_http_cron_timer));
-//     ngx_http_cron_timer.handler = ngx_http_cron_timer_handler;
-//     ngx_http_cron_timer.data    = NULL;
-//     ngx_http_cron_timer.log     = cycle->log;
-//     ngx_http_cron_timer.cancelable = 1;
-
-//     // Schedule the first timer event
-//     ngx_add_timer(&ngx_http_cron_timer, NGX_HTTP_CRON_INTERVAL);
-
-//     return NGX_OK;
-// }
-
 #[no_mangle]
 extern "C" fn ngx_http_cron_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     unsafe {
