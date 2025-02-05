@@ -47,7 +47,7 @@ impl Event {
             key
         );
         unsafe {
-            ngx_rbtree_insert(&mut ngx_event_timer_rbtree as *mut _, &mut self.0.timer as *mut _);
+            ngx_rbtree_insert(&raw mut ngx_event_timer_rbtree as *mut _, &mut self.0.timer as *mut _);
         }
 
         self.0.set_timer_set(1);
@@ -63,7 +63,7 @@ impl Event {
             self.0.timer.key
         );
         unsafe {
-            ngx_rbtree_delete(&mut ngx_event_timer_rbtree as *mut _, &mut self.0.timer as *mut _);
+            ngx_rbtree_delete(&raw mut ngx_event_timer_rbtree as *mut _, &mut self.0.timer as *mut _);
         }
 
         self.0.set_timer_set(0);

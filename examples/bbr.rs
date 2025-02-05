@@ -1,6 +1,6 @@
 use cpu_arl_rs::{cpu, limiter};
 use nginx_sys::ngx_http_log_handler_pt;
-use std::path;
+use std::panic;
 use std::ptr::addr_of;
 
 use once_cell::sync::Lazy;
@@ -9,13 +9,14 @@ use std::sync::{Arc, RwLock};
 
 use ngx::ffi::{
     ngx_array_push, ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t, ngx_event_t, ngx_exiting,
-    ngx_http_core_module, ngx_http_handler_pt, ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE,
-    ngx_http_phases_NGX_HTTP_LOG_PHASE, ngx_int_t, ngx_module_t, ngx_process, ngx_quit, ngx_str_t, ngx_uint_t,
-    ngx_worker, NGX_CONF_TAKE1, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_PROCESS_WORKER,
+    ngx_http_conf_ctx_t, ngx_http_core_module, ngx_http_handler_pt, ngx_http_module_t,
+    ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_http_phases_NGX_HTTP_LOG_PHASE, ngx_int_t, ngx_module_t, ngx_process,
+    ngx_quit, ngx_str_t, ngx_uint_t, ngx_worker, NGX_CONF_TAKE1, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET,
+    NGX_HTTP_MODULE, NGX_PROCESS_WORKER,
 };
 use ngx::http::{self, HTTPModule, MergeConfigError};
 use ngx::{core, ffi};
-use ngx::{http_log_handler, http_request_handler, ngx_log_debug_http, ngx_log_error, ngx_null_command, ngx_string};
+use ngx::{http_log_handler, http_request_handler, ngx_log_error, ngx_null_command, ngx_string};
 
 struct Module;
 
@@ -45,12 +46,14 @@ impl http::HTTPModule for Module {
     }
 }
 
+#[derive(Debug)]
 struct ModuleConfig {
     cpu_provider: limiter::CPUStatProviderName,
     enable: bool,
 }
 
-static GLOBAL_CPU_LOADER: Lazy<RwLock<Option<Arc<cpu::EMACPUUsageLoader>>>> = Lazy::new(|| RwLock::new(None));
+static GLOBAL_CPU_LOADER: Lazy<Arc<RwLock<Option<Arc<cpu::EMACPUUsageLoader>>>>> =
+    Lazy::new(|| Arc::new(RwLock::new(None)));
 
 impl Default for ModuleConfig {
     fn default() -> Self {
@@ -58,29 +61,6 @@ impl Default for ModuleConfig {
             cpu_provider: limiter::CPUStatProviderName::Machine,
             enable: false,
         };
-        match cfg.cpu_provider {
-            limiter::CPUStatProviderName::Machine => {
-                let provider = cpu::MachineCPUStatProvider::new().unwrap();
-                let loader = Arc::new(cpu::EMACPUUsageLoader::new(Box::new(provider)));
-                GLOBAL_CPU_LOADER.write().unwrap().replace(loader);
-            }
-            #[cfg(target_os = "linux")]
-            limiter::CPUStatProviderName::CGroup => {
-                use cpu_arl_rs::cgroup;
-                let provider =
-                    cgroup::CGroupCPUStatProvider::new(path::PathBuf::from("/sys/fs/cgroup/"), false).unwrap();
-                let loader = Arc::new(cpu::EMACPUUsageLoader::new(Box::new(provider)));
-                GLOBAL_CPU_LOADER.write().unwrap().replace(loader);
-            }
-            _ => {
-                panic!("unsupported cpu provider: {:?}", cfg.cpu_provider);
-            }
-        }
-
-        let opts = limiter::Options::default();
-        let cpu_getter = Box::new(|| GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().get_cpu_usage());
-        let limiter = limiter::ARLLimiter::new(cpu_getter, opts);
-        GLOBAL_LIMITER.write().unwrap().replace(Arc::new(limiter));
 
         cfg
     }
@@ -234,6 +214,37 @@ extern "C" fn ngx_http_cpu_loader_init_process(cycle: *mut ngx_cycle_t) -> ngx_i
             ngx_worker,
         );
 
+        let bbr_cfg = {
+            let http_ctx = (*cycle).conf_ctx.add(ngx_http_core_module.ctx_index as usize) as *mut ngx_http_conf_ctx_t;
+            let raw_conf = (*http_ctx).main_conf.add(ngx_http_bbr_module.ctx_index) as *mut *mut ModuleConfig;
+            unsafe { raw_conf.cast::<ModuleConfig>().as_ref().expect("module config is none") }
+        };
+        println!("bbr module enabled: {:?}/{:?}", bbr_cfg, std::process::id());
+        match bbr_cfg.cpu_provider {
+            limiter::CPUStatProviderName::Machine => {
+                let loader = Arc::new(cpu::EMACPUUsageLoader::new(Box::new(
+                    cpu::MachineCPUStatProvider::new().unwrap(),
+                )));
+                unsafe { GLOBAL_CPU_LOADER.write().unwrap().replace(loader) };
+            }
+            #[cfg(target_os = "linux")]
+            limiter::CPUStatProviderName::CGroup => {
+                use cpu_arl_rs::cgroup;
+                let provider =
+                    cgroup::CGroupCPUStatProvider::new(path::PathBuf::from("/sys/fs/cgroup/"), false).unwrap();
+                let loader = Arc::new(cpu::EMACPUUsageLoader::new(Box::new(provider)));
+                GLOBAL_CPU_LOADER.write().unwrap().replace(loader);
+            }
+            _ => {
+                panic!("unsupported cpu provider: {:?}", bbr_cfg.cpu_provider);
+            }
+        }
+
+        let opts = limiter::Options::default();
+        let cpu_getter = Box::new(|| unsafe { GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().get_cpu_usage() });
+        let limiter = limiter::ARLLimiter::new(cpu_getter, opts);
+        GLOBAL_LIMITER.write().unwrap().replace(Arc::new(limiter));
+
         let ngx_http_cron_dummy_conn = core::Pool::from_ngx_pool((*cycle).pool)
             .alloc(std::mem::size_of::<ngx_connection_t>())
             as *mut ngx_connection_t;
@@ -265,7 +276,7 @@ extern "C" fn ngx_http_cpu_loader_timer_handler(ev: *mut ngx_event_t) {
             ffi::NGX_LOG_ERR,
             (*ev).log,
             "[bbr-module] CPU usage: {:.2}%, max_inflight: {:?}, inflight: {:?}",
-            limiter.get_cpu_usage(),
+            GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().get_cpu_usage() / 10.0,
             limiter.max_in_flight(),
             limiter.in_flight(),
         );

@@ -1,23 +1,12 @@
-use cpu_arl_rs::limiter;
-use nginx_sys::ngx_http_log_handler_pt;
 use ngx::core::Event;
-use std::ptr::{addr_of, addr_of_mut};
-
-use once_cell::sync::Lazy;
-use std::ffi::{c_char, c_void};
-use std::sync::{Arc, RwLock};
-
 use ngx::ffi::{
-    ngx_array_push, ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t, ngx_event_t, ngx_event_timer_rbtree,
-    ngx_exiting, ngx_http_core_module, ngx_http_handler_pt, ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE,
-    ngx_http_phases_NGX_HTTP_LOG_PHASE, ngx_int_t, ngx_module_t, ngx_msec_int_t, ngx_msec_t, ngx_posted_events,
-    ngx_process, ngx_queue_s, ngx_quit, ngx_rbtree_delete, ngx_rbtree_insert, ngx_str_t, ngx_uint_t, ngx_worker,
-    NGX_CONF_TAKE1, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_PROCESS_WORKER,
-    NGX_TIMER_LAZY_DELAY,
+    ngx_command_t, ngx_connection_t, ngx_cycle_t, ngx_event_t, ngx_exiting, ngx_http_module_t, ngx_int_t, ngx_module_t,
+    ngx_process, ngx_quit, ngx_worker, NGX_HTTP_MODULE, NGX_PROCESS_WORKER,
 };
-use ngx::http::{self, HTTPModule, MergeConfigError};
+use ngx::http::{self, HTTPModule};
 use ngx::{core, ffi};
-use ngx::{http_log_handler, http_request_handler, ngx_log_debug_http, ngx_log_error, ngx_null_command, ngx_string};
+use ngx::{ngx_log_error, ngx_null_command};
+use std::ffi::c_void;
 
 struct TaskModule;
 
@@ -96,7 +85,7 @@ extern "C" fn ngx_http_cron_timer_handler(ev: *mut ngx_event_t) {
         ngx_log_error!(
             ffi::NGX_LOG_NOTICE,
             (*ev).log,
-            "[cron-module] Timer triggered. Do your periodic work here."
+            "[cron-module] Timer triggered. Do your periodic work here.",
         );
 
         if !(ngx_exiting == 1) && !(ngx_quit == 1) {
