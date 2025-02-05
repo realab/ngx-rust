@@ -230,6 +230,7 @@ extern "C" fn ngx_http_cpu_loader_init_process(cycle: *mut ngx_cycle_t) -> ngx_i
             #[cfg(target_os = "linux")]
             limiter::CPUStatProviderName::CGroup => {
                 use cpu_arl_rs::cgroup;
+                use std::path;
                 let provider =
                     cgroup::CGroupCPUStatProvider::new(path::PathBuf::from("/sys/fs/cgroup/"), false).unwrap();
                 let loader = Arc::new(cpu::EMACPUUsageLoader::new(Box::new(provider)));
