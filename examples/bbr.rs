@@ -16,7 +16,7 @@ use ngx::ffi::{
 };
 use ngx::http::{self, HTTPModule, MergeConfigError};
 use ngx::{core, ffi};
-use ngx::{http_log_handler, http_request_handler, ngx_log_error, ngx_null_command, ngx_string};
+use ngx::{http_log_handler, http_request_handler, ngx_log_debug_http, ngx_log_error, ngx_null_command, ngx_string};
 
 struct Module;
 
@@ -168,8 +168,19 @@ http_request_handler!(bbr_access_handler, |request: &mut http::Request| {
                 }
                 return core::Status::NGX_DECLINED;
             }
-            // ngx_log_debug_http!(request, "bbr module: BANDWIDTH_LIMIT_EXCEEDED");
-            println!("bbr module: BANDWIDTH_LIMIT_EXCEEDED");
+            ngx_log_error!(
+                ffi::NGX_LOG_NOTICE,
+                unsafe { (*request.connection()).log },
+                "bbr module: BANDWIDTH_LIMIT_EXCEEDED"
+            );
+            ngx_log_error!(
+                ffi::NGX_LOG_NOTICE,
+                unsafe { (*request.connection()).log },
+                "[bbr-module] BANDWIDTH_LIMIT_EXCEEDED CPU usage: {:.2}%, max_inflight: {:?}, inflight: {:?}",
+                GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().get_cpu_usage() / 10.0,
+                limiter.max_in_flight(),
+                limiter.in_flight(),
+            );
             http::HTTPStatus::BANDWIDTH_LIMIT_EXCEEDED.into()
         }
         false => core::Status::NGX_DECLINED,
