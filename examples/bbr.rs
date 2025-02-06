@@ -1,6 +1,5 @@
 use cpu_arl_rs::{cpu, limiter};
 use nginx_sys::ngx_http_log_handler_pt;
-use std::panic;
 use std::ptr::addr_of;
 
 use once_cell::sync::Lazy;
@@ -16,7 +15,7 @@ use ngx::ffi::{
 };
 use ngx::http::{self, HTTPModule, MergeConfigError};
 use ngx::{core, ffi};
-use ngx::{http_log_handler, http_request_handler, ngx_log_debug_http, ngx_log_error, ngx_null_command, ngx_string};
+use ngx::{http_log_handler, http_request_handler, ngx_log_error, ngx_null_command, ngx_string};
 
 struct Module;
 
