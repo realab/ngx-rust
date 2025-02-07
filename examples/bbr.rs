@@ -1,5 +1,4 @@
 use cpu_arl_rs::{cpu, limiter};
-use nginx_sys::ngx_http_log_handler_pt;
 use std::ptr::addr_of;
 
 use once_cell::sync::Lazy;
@@ -7,15 +6,14 @@ use std::ffi::{c_char, c_void};
 use std::sync::{Arc, RwLock};
 
 use ngx::ffi::{
-    ngx_array_push, ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t, ngx_event_t, ngx_exiting,
-    ngx_http_conf_ctx_t, ngx_http_core_module, ngx_http_handler_pt, ngx_http_module_t,
+    self, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t, ngx_event_t, ngx_exiting,
+    ngx_http_conf_ctx_t, ngx_http_core_module, ngx_http_handler_pt, ngx_http_log_handler_pt, ngx_http_module_t,
     ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_http_phases_NGX_HTTP_LOG_PHASE, ngx_int_t, ngx_module_t, ngx_process,
     ngx_quit, ngx_str_t, ngx_uint_t, ngx_worker, NGX_CONF_TAKE1, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET,
-    NGX_HTTP_MODULE, NGX_PROCESS_WORKER,
+    NGX_HTTP_MODULE, NGX_LOG_NOTICE, NGX_PROCESS_WORKER,
 };
 use ngx::http::{self, HTTPModule, MergeConfigError};
-use ngx::{core, ffi};
-use ngx::{http_log_handler, http_request_handler, ngx_log_error, ngx_null_command, ngx_string};
+use ngx::{core, http_log_handler, http_request_handler, ngx_log_error, ngx_null_command, ngx_string};
 
 struct Module;
 
@@ -168,12 +166,7 @@ http_request_handler!(bbr_access_handler, |request: &mut http::Request| {
                 return core::Status::NGX_DECLINED;
             }
             ngx_log_error!(
-                ffi::NGX_LOG_NOTICE,
-                unsafe { (*request.connection()).log },
-                "bbr module: BANDWIDTH_LIMIT_EXCEEDED"
-            );
-            ngx_log_error!(
-                ffi::NGX_LOG_NOTICE,
+                NGX_LOG_NOTICE,
                 unsafe { (*request.connection()).log },
                 "[bbr-module] BANDWIDTH_LIMIT_EXCEEDED CPU usage: {:.2}%, max_inflight: {:?}, inflight: {:?}",
                 GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().get_cpu_usage() / 10.0,
