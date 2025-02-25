@@ -1,4 +1,5 @@
 use cpu_arl_rs::{cpu, limiter};
+use nginx_sys::NGX_LOG_ERR;
 use std::ptr::addr_of;
 
 use once_cell::sync::Lazy;
@@ -6,11 +7,11 @@ use std::ffi::{c_char, c_void};
 use std::sync::{Arc, RwLock};
 
 use ngx::ffi::{
-    self, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t, ngx_event_t, ngx_exiting,
-    ngx_http_conf_ctx_t, ngx_http_core_module, ngx_http_handler_pt, ngx_http_log_handler_pt, ngx_http_module_t,
-    ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_http_phases_NGX_HTTP_LOG_PHASE, ngx_int_t, ngx_module_t, ngx_process,
-    ngx_quit, ngx_str_t, ngx_uint_t, ngx_worker, NGX_CONF_TAKE1, NGX_HTTP_MAIN_CONF, NGX_HTTP_MAIN_CONF_OFFSET,
-    NGX_HTTP_MODULE, NGX_LOG_NOTICE, NGX_PROCESS_WORKER,
+    self, ngx_array_push, ngx_command_t, ngx_conf_t, ngx_connection_t, ngx_cycle_t, ngx_event_actions, ngx_event_t,
+    ngx_exiting, ngx_http_conf_ctx_t, ngx_http_core_module, ngx_http_handler_pt, ngx_http_log_handler_pt,
+    ngx_http_module_t, ngx_http_phases_NGX_HTTP_ACCESS_PHASE, ngx_http_phases_NGX_HTTP_LOG_PHASE, ngx_int_t,
+    ngx_module_t, ngx_process, ngx_quit, ngx_str_t, ngx_uint_t, ngx_worker, NGX_CONF_TAKE1, NGX_HTTP_MAIN_CONF,
+    NGX_HTTP_MAIN_CONF_OFFSET, NGX_HTTP_MODULE, NGX_LOG_NOTICE, NGX_PROCESS_WORKER,
 };
 use ngx::http::{self, HTTPModule, MergeConfigError};
 use ngx::{core, http_log_handler, http_request_handler, ngx_log_error, ngx_null_command, ngx_string};
@@ -132,7 +133,15 @@ impl NgxBBRCtx {
 http_log_handler!(
     bbr_done_handler,
     |request: &mut http::Request, _: &mut http::Request| {
-        let bbr_ctx = unsafe { request.get_mutable_module_ctx::<NgxBBRCtx>(&*addr_of!(ngx_http_bbr_module)) };
+        let bbr_ctx = unsafe {
+            request
+                .get_inner()
+                .ctx
+                .add((&*addr_of!(ngx_http_bbr_module)).ctx_index)
+                .cast::<NgxBBRCtx>()
+                .as_mut()
+        };
+        // let bbr_ctx = unsafe { request.get_mutable_module_ctx::<NgxBBRCtx>(&*addr_of!(ngx_http_bbr_module)) };
         if let Some(ctx) = bbr_ctx {
             // ngx_log_debug_http!(request, "bbr: found context",);
             ctx.call_done();
@@ -203,6 +212,12 @@ extern "C" fn ngx_http_bbr_commands_set_enable(
     std::ptr::null_mut()
 }
 
+unsafe fn get_bbr_config_from_cycle(cycle: *mut ngx_cycle_t) -> &'static ModuleConfig {
+    let http_ctx = (*cycle).conf_ctx.add(ngx_http_core_module.ctx_index as usize) as *mut ngx_http_conf_ctx_t;
+    let raw_conf = (*http_ctx).main_conf.add(ngx_http_bbr_module.ctx_index) as *mut *mut ModuleConfig;
+    raw_conf.cast::<ModuleConfig>().as_ref().expect("module config is none")
+}
+
 #[no_mangle]
 extern "C" fn ngx_http_cpu_loader_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
     unsafe {
@@ -211,24 +226,32 @@ extern "C" fn ngx_http_cpu_loader_init_process(cycle: *mut ngx_cycle_t) -> ngx_i
         }
 
         ngx_log_error!(
-            ffi::NGX_LOG_NOTICE,
+            ffi::NGX_LOG_ERR,
             (*cycle).log,
-            "[cron-module] Initializing cron timer in worker process {}",
+            "[bbr-module] Initializing cpu loader timer in worker process {}",
             ngx_worker,
         );
 
-        let bbr_cfg = {
-            let http_ctx = (*cycle).conf_ctx.add(ngx_http_core_module.ctx_index as usize) as *mut ngx_http_conf_ctx_t;
-            let raw_conf = (*http_ctx).main_conf.add(ngx_http_bbr_module.ctx_index) as *mut *mut ModuleConfig;
-            unsafe { raw_conf.cast::<ModuleConfig>().as_ref().expect("module config is none") }
-        };
-        println!("bbr module enabled: {:?}/{:?}", bbr_cfg, std::process::id());
+        // let bbr_cfg = {
+        //     let http_ctx = (*cycle).conf_ctx.add(ngx_http_core_module.ctx_index as usize) as *mut ngx_http_conf_ctx_t;
+        //     let raw_conf = (*http_ctx).main_conf.add(ngx_http_bbr_module.ctx_index) as *mut *mut ModuleConfig;
+        //     raw_conf.cast::<ModuleConfig>().as_ref().expect("module config is none")
+        // };
+        let bbr_cfg = get_bbr_config_from_cycle(cycle);
+        ngx_log_error!(
+            NGX_LOG_ERR,
+            (*cycle).log,
+            "[bbr-module] bbr module enabled: {:?}/{}",
+            bbr_cfg,
+            ngx_worker,
+        );
+        // println!("bbr module enabled: {:?}/{:?}", bbr_cfg, std::process::id());
         match bbr_cfg.cpu_provider {
             limiter::CPUStatProviderName::Machine => {
                 let loader = Arc::new(cpu::EMACPUUsageLoader::new(Box::new(
                     cpu::MachineCPUStatProvider::new().unwrap(),
                 )));
-                unsafe { GLOBAL_CPU_LOADER.write().unwrap().replace(loader) };
+                GLOBAL_CPU_LOADER.write().unwrap().replace(loader);
             }
             #[cfg(target_os = "linux")]
             limiter::CPUStatProviderName::CGroup => {
@@ -245,7 +268,7 @@ extern "C" fn ngx_http_cpu_loader_init_process(cycle: *mut ngx_cycle_t) -> ngx_i
         }
 
         let opts = limiter::Options::default();
-        let cpu_getter = Box::new(|| unsafe { GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().get_cpu_usage() });
+        let cpu_getter = Box::new(|| GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().get_cpu_usage());
         let limiter = limiter::ARLLimiter::new(cpu_getter, opts);
         GLOBAL_LIMITER.write().unwrap().replace(Arc::new(limiter));
 
@@ -277,7 +300,7 @@ extern "C" fn ngx_http_cpu_loader_timer_handler(ev: *mut ngx_event_t) {
     let limiter = limiter.as_ref().unwrap();
     unsafe {
         ngx_log_error!(
-            ffi::NGX_LOG_ERR,
+            ffi::NGX_LOG_DEBUG,
             (*ev).log,
             "[bbr-module] CPU usage: {:.2}%, max_inflight: {:?}, inflight: {:?}",
             GLOBAL_CPU_LOADER.read().unwrap().as_ref().unwrap().get_cpu_usage() / 10.0,

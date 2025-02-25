@@ -52,6 +52,8 @@ extern "C" fn ngx_http_cron_init_process(cycle: *mut ngx_cycle_t) -> ngx_int_t {
             return core::Status::NGX_OK.into();
         }
 
+        ngx_hyper::handle_request(cycle);
+
         ngx_log_error!(
             ffi::NGX_LOG_NOTICE,
             (*cycle).log,
@@ -92,5 +94,127 @@ extern "C" fn ngx_http_cron_timer_handler(ev: *mut ngx_event_t) {
             let event: &mut Event = ev.into();
             event.add_timer(1000);
         }
+    }
+}
+
+pub mod ngx_hyper {
+    use hyper::rt::Executor;
+    use ngx::ffi::ngx_event_t;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::Arc;
+    use std::task::{Context, Poll, Wake, Waker};
+
+    // Custom waker that uses nginx events
+    struct NgxWaker {
+        event: *mut ngx_event_t,
+    }
+
+    impl NgxWaker {
+        fn new(event: *mut ngx_event_t) -> Self {
+            Self { event }
+        }
+    }
+
+    unsafe impl Send for NgxWaker {}
+    unsafe impl Sync for NgxWaker {}
+
+    impl Wake for NgxWaker {
+        fn wake(self: Arc<Self>) {
+            unsafe {
+                (*self.event).handler.unwrap()(self.event);
+            }
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            unsafe {
+                (*self.event).handler.unwrap()(self.event);
+            }
+        }
+    }
+
+    // Executor implementation that uses nginx's event loop
+    #[derive(Clone)]
+    pub struct NgxHyperExecutor {
+        cycle: *mut ngx::ffi::ngx_cycle_t,
+    }
+
+    unsafe impl Send for NgxHyperExecutor {}
+    unsafe impl Sync for NgxHyperExecutor {}
+
+    impl NgxHyperExecutor {
+        pub fn new(cycle: *mut ngx::ffi::ngx_cycle_t) -> Self {
+            Self { cycle }
+        }
+
+        fn create_event(&self) -> *mut ngx_event_t {
+            unsafe {
+                let event =
+                    ngx::ffi::ngx_pcalloc((*self.cycle).pool, std::mem::size_of::<ngx_event_t>() as libc::size_t)
+                        as *mut ngx_event_t;
+
+                (*event).log = (*self.cycle).log;
+                event
+            }
+        }
+    }
+
+    impl<F> Executor<F> for NgxHyperExecutor
+    where
+        F: Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        fn execute(&self, future: F) {
+            let event = self.create_event();
+
+            // Create waker using nginx event
+            let waker = Arc::new(NgxWaker::new(event)).into();
+            let mut context = Context::from_waker(&waker);
+
+            // Pin the future and start polling
+            let mut pinned = Box::pin(future);
+            unsafe {
+                (*event).data = Box::into_raw(Box::new(&pinned)) as *mut libc::c_void;
+            }
+
+            unsafe {
+                // Set up the event handler
+                (*event).handler = Some(event_done_handler);
+
+                // Initial poll
+                if let Poll::Pending = pinned.as_mut().poll(&mut context) {
+                    // Future is pending, let it continue running
+                    std::mem::forget(pinned);
+                }
+            }
+        }
+    }
+
+    // Helper function to create executor from current nginx cycle
+    pub fn create_executor(cycle: *mut ngx::ffi::ngx_cycle_t) -> NgxHyperExecutor {
+        NgxHyperExecutor::new(cycle)
+    }
+
+    pub unsafe extern "C" fn event_done_handler(event: *mut ngx_event_t) {
+        let waker = Arc::new(NgxWaker::new(event)).into();
+        let mut context = Context::from_waker(&waker);
+
+        let mut pinned = unsafe { Box::<Pin<&mut dyn Future<Output = ()>>>::from_raw((*event).data as *mut _) };
+        if let Poll::Pending = pinned.as_mut().as_mut().poll(&mut context) {
+            // Future is still pending, will be woken up later
+            return;
+        }
+        // Future is complete, clean up the event
+        // ngx::ffi::ngx_pfree((*(*event).pool).pool, event as *mut std::ffi::c_void);
+    }
+
+    pub fn handle_request(cycle: *mut ngx::ffi::ngx_cycle_t) {
+        let executor = create_executor(cycle);
+        let builder = hyper_util::client::legacy::Client::builder(executor);
+        // let client = builder.build(hyper_util::client::legacy::Connector::new(executor));
+
+        // hyper::rt::spawn(hyper::rt::Handle::new(executor), async {});
+        // let client = hyper::Client::builder().executor(executor).build_http();
+        // Use client...
     }
 }
